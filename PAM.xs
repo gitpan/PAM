@@ -4,10 +4,27 @@
 
 #include "ppport.h"
 
-#include <security/pam_misc.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <syslog.h>
+
+#include <security/pam_modules.h>
+#include <security/pam_appl.h>
+#include <security/pam_ext.h>
 #include "const-c.inc"
 
 #include "xs_object_magic.h"
+
+#include "perl_helper.h"
+
+#define DEBUGGING
+
+static void cleanup_data(pam_handle_t*, void*, int);
+
+static void cleanup_data(pam_handle_t *pamh, void *data, int error_status) {
+    free(data);
+}
 
 MODULE = PAM    PACKAGE = PAM::Constants
 
@@ -35,12 +52,14 @@ get_user(pam_handle, ...)
         RETVAL
 
 SV*
-get_item(pam_handle, item_type)
-    pam_handle_t* pam_handle
+get_item(SV *self, item_type)
     int item_type
     PREINIT:
+        pam_handle_t* pam_handle;
         const void* item;
         int rv;
+    INIT:
+        pam_handle = xs_object_magic_get_struct_rv(aTHX_ self);
     CODE:
         switch (item_type)
         {
@@ -52,7 +71,9 @@ get_item(pam_handle, item_type)
             case PAM_RHOST :
             case PAM_AUTHTOK :
             case PAM_OLDAUTHTOK :
+#ifdef __LINUX_PAM__
             case PAM_XDISPLAY : // Linux specific
+#endif
                 rv = pam_get_item(pam_handle, item_type, &item);
                 if (rv == PAM_SUCCESS)
                     RETVAL = newSVpv((char*)item, 0);
@@ -61,9 +82,24 @@ get_item(pam_handle, item_type)
             break;
 
             case PAM_CONV :
+                rv = pam_get_item(pam_handle, item_type, &item);
+                if (rv == PAM_SUCCESS) {
+                    SV* pamc = xs_object_magic_create(aTHX_ (void*)item, gv_stashpv("PAM::Conversation", GV_ADD));
+
+                    SV* pamh_ref = newRV_inc(SvRV(self));
+                    if (hv_stores((HV*)SvRV(pamc), "handle", pamh_ref) == NULL)
+                        SvREFCNT_dec(pamh_ref);
+
+                    RETVAL = pamc;
+                } else {
+                    RETVAL = &PL_sv_undef;
+                }
+            break;
+#ifdef __LINUX_PAM__
             case PAM_FAIL_DELAY :   // Linux specific
             case PAM_XAUTHDATA :    // Linux specific
             case PAM_AUTHTOK_TYPE : // Linux specific
+#endif
             default :
                 RETVAL = &PL_sv_undef;
             break;
@@ -90,15 +126,19 @@ set_item(pam_handle, item_type, item_sv)
             case PAM_RHOST :
             case PAM_AUTHTOK :
             case PAM_OLDAUTHTOK :
+#ifdef __LINUX_PAM__
             case PAM_XDISPLAY : // Linux specific
+#endif
                 item = SvPV_nolen(item_sv);
                 rv = pam_set_item(pam_handle, item_type, item);
             break;
 
             case PAM_CONV :
+#ifdef __LINUX_PAM__
             case PAM_FAIL_DELAY :   // Linux specific
             case PAM_XAUTHDATA :    // Linux specific
             case PAM_AUTHTOK_TYPE : // Linux specific
+#endif
             default :
             break;
         }
@@ -108,7 +148,7 @@ get_data(pam_handle, name)
     pam_handle_t* pam_handle
     const char* name
     PREINIT:
-        void* data;
+        const void* data;
         int rv;
     CODE:
         rv = pam_get_data(pam_handle, name, &data);
@@ -125,11 +165,22 @@ set_data(pam_handle, name, data_sv)
     const char* name
     SV* data_sv
     PREINIT:
-        const void* data;
+        const void *data;
+        void *datacpy;
         int rv;
+        STRLEN len = 0;
     CODE:
-        data = SvPV_nolen(data_sv);
-        rv = pam_set_data(pam_handle, name, data);
+        if (SvOK(data_sv)) {
+            data = SvPV(data_sv, len);
+            datacpy = malloc(len);
+            if (datacpy == NULL)
+                croak("Unable to allocate memory\n");
+            memcpy(datacpy, data, len);
+            rv = pam_set_data(pam_handle, name, datacpy, &cleanup_data);
+        } else {
+            // undef should set null
+            rv = pam_set_data(pam_handle, name, NULL, NULL);
+        }
 
 void
 getenvlist(pam_handle)
@@ -177,5 +228,90 @@ strerror(pam_handle, errnum)
     CODE:
         errstr = pam_strerror(pam_handle, errnum);
         RETVAL = newSVpv(errstr, 0);
+    OUTPUT:
+        RETVAL
+
+MODULE = PAM    PACKAGE = PAM::Conversation
+
+int
+run(SV *self, ...)
+    PREINIT:
+        struct pam_conv* pamc;
+        struct pam_message **msg = NULL;
+        struct pam_response *resp = NULL;
+        int rv, i;
+        SV** pamh_ref;
+    INIT:
+        pamc = xs_object_magic_get_struct_rv(aTHX_ self);
+    CODE:
+        pamh_ref = hv_fetchs((HV*)SvRV(self), "handle", 0);
+        SvREFCNT_inc(*pamh_ref);
+        items--; // self takes up one
+
+        if (pamh_ref != NULL) {
+            pam_handle_t* pamh = xs_object_magic_get_struct_rv(aTHX_ *pamh_ref);
+
+            msg = malloc(sizeof(struct pam_message*) * items);
+            msg[0] = malloc(sizeof(struct pam_message) * items);
+
+        #ifdef DEBUGGING
+            pam_syslog(pamh, LOG_DEBUG, "Allocated memory for %d items", items);
+        #endif
+
+            for (i = 1; i < items; i++) {
+                msg[i] = msg[0] + (sizeof(struct pam_message) * i);
+            }
+
+        #ifdef DEBUGGING
+            pam_syslog(pamh, LOG_DEBUG, "Done doubly linking list");
+        #endif
+
+            for (i = 0; i < items; i++) {
+        #ifdef DEBUGGING
+                pam_syslog(pamh, LOG_DEBUG, "Handling arg item %d", i);
+        #endif
+                SV *item_rv = ST(i+1);
+                if((SvTYPE(SvRV(item_rv)) != SVt_PVAV)) {
+                    croak("PAM::Conversation::run arguments should be all arrayrefs with two elements, %d is not an arrayref.", i);
+                }
+
+                AV *item = (AV*)SvRV(item_rv);
+                if(av_len(item) != 1) { // av_len returns highest index, not true length, so 1 == 2 items
+                    croak("PAM::Conversation::run arguments should be all arrayrefs with two elements, %d is not two elements long.", i);
+                }
+
+                {
+                    SV **temp = av_fetch(item, 0, 0);
+                    if (temp == NULL)
+                        croak("PAM::Conversation::run argument %d element zero was NULL.", i);
+                    if (*temp == NULL)
+                        croak("PAM::Conversation::run argument %d element zero was pointer to NULL.", i);
+                    msg[i]->msg_style = SvIV(*temp);
+                }
+                {
+                    SV **temp = av_fetch(item, 1, 0);
+                    if (temp == NULL)
+                        croak("PAM::Conversation::run argument %d element one was NULL.", i);
+                    if (*temp == NULL)
+                        croak("PAM::Conversation::run argument %d element one was pointer to NULL.", i);
+                    msg[i]->msg       = SvPV_nolen(*temp);
+                }
+        #ifdef DEBUGGING
+                pam_syslog(pamh, LOG_DEBUG, "Message configued is code %d string %s", msg[i]->msg_style, msg[i]->msg);
+        #endif
+            }
+
+            // This takes me back to the other perl interpreter
+            start_perl_callback(pamh);
+
+            rv = (*(pamc->conv))(items, (const struct pam_message **)msg, &resp, pamc->appdata_ptr);
+
+            free(msg[0]);
+
+            // And now back into my perl interpreter
+            end_perl_callback(pamh);
+        }
+
+        SvREFCNT_dec(*pamh_ref);
     OUTPUT:
         RETVAL
