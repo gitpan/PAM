@@ -30,7 +30,7 @@ and constants.
 require 5.008001;
 use parent qw(DynaLoader);
 
-our $VERSION = '0.02';
+our $VERSION = '0.30';
 
 sub dl_load_flags {0x01}
 
@@ -42,7 +42,7 @@ $VERSION = eval $VERSION;
 
 =head1 COPYRIGHT
 
-Copyright 2010 - Jonathan Steinert
+Copyright 2012 - Jonathan Steinert
 
 =head1 AUTHOR
 
