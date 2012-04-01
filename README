@@ -1,5 +1,13 @@
-This PAM module is available under the same terms as perl itself.
 
-I would however point out that you shouldn't use it as-is right now, many return codes and inputs are not checked for validity and safety.
 
-It compiles, it works... but I don't trust it yet.
+This archive contains the distribution PAM,
+version 0.31:
+
+  Invoke perl code at PAM phases
+
+This software is copyright (c) 2012 by Jonathan Steinert.
+
+This is free software; you can redistribute it and/or modify it under
+the same terms as the Perl 5 programming language system itself.
+
+

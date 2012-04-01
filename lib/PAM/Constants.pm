@@ -1,4 +1,17 @@
 package PAM::Constants;
+{
+  $PAM::Constants::VERSION = '0.31';
+}
+
+=head1 NAME
+
+PAM::Constants - Module to import constants for use with PAM
+
+=head1 VERSION
+
+version 0.31
+
+=cut
 
 use strict;
 use warnings;
